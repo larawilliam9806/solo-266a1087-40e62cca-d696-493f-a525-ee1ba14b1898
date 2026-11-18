@@ -1,4 +1,4 @@
-"""Flask 路由：上传校验 → 预览增删改 → 确认整批替换。"""
+"""Flask 路由：上传校验 → 预览增删改 → 确认整批替换；串号核查 → 更名建议 → 确认置换。"""
 from __future__ import annotations
 
 import os
@@ -17,6 +17,19 @@ from flask import (
 )
 
 from .storage import LIVE_FILENAME, PublishConflictError, Storage
+from .swapcheck import (
+    MAX_SELECTED,
+    MIN_COMMON_ANALYTES,
+    MIN_SELECTED,
+    changed_pairs,
+    common_analytes,
+    cost_matrix,
+    evidence_rows,
+    identity_cost,
+    mapping_from_assignment,
+    optimal_assignments,
+    possible_targets,
+)
 from .validation import format_concentration, validate_csv
 
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
@@ -162,6 +175,221 @@ def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -
         if storage.cancel_session(token):
             flash("已放弃本次修订，当前发布版本未受影响", "info")
         return redirect(url_for("index"))
+
+    # ---------- 串号核查 ----------
+    @app.get("/swap-check")
+    def swap_check():
+        reg = storage.current_registry()
+        versions = storage.list_versions()
+        known = {v["version"] for v in versions}
+        ref_version = request.args.get("ref", type=int)
+        cur_version = request.args.get("cur", type=int)
+        if cur_version is None and reg:
+            cur_version = reg["current_version"]
+
+        common_samples = None
+        if ref_version is not None and cur_version is not None:
+            if ref_version == cur_version:
+                flash("参考版本与当前版本不能相同", "error")
+            elif ref_version not in known or cur_version not in known:
+                flash("所选版本不存在", "error")
+            else:
+                ref_stats = {
+                    s["sample_no"]: s["analyte_count"]
+                    for s in storage.version_samples(ref_version)
+                }
+                cur_stats = {
+                    s["sample_no"]: s["analyte_count"]
+                    for s in storage.version_samples(cur_version)
+                }
+                common_samples = [
+                    {
+                        "sample_no": s,
+                        "ref_count": ref_stats[s],
+                        "cur_count": cur_stats[s],
+                    }
+                    for s in sorted(ref_stats.keys() & cur_stats.keys())
+                ]
+        return render_template(
+            "swap_check.html",
+            reg=reg,
+            versions=versions,
+            ref_version=ref_version,
+            cur_version=cur_version,
+            common_samples=common_samples,
+            min_selected=MIN_SELECTED,
+            max_selected=MAX_SELECTED,
+        )
+
+    @app.post("/swap-check/analyze")
+    def swap_analyze():
+        versions = {v["version"]: v for v in storage.list_versions()}
+        try:
+            ref_version = int(request.form.get("ref", ""))
+            cur_version = int(request.form.get("cur", ""))
+        except (TypeError, ValueError):
+            flash("版本选择无效", "error")
+            return redirect(url_for("swap_check"))
+        if (ref_version == cur_version or ref_version not in versions
+                or cur_version not in versions):
+            flash("参考版本与当前版本必须不同且都是已发布版本", "error")
+            return redirect(url_for("swap_check"))
+
+        selected = list(dict.fromkeys(request.form.getlist("sample")))
+        ref_rows = storage.version_rows(ref_version)
+        cur_rows = storage.version_rows(cur_version)
+        both = ({r["sample_no"] for r in ref_rows}
+                & {r["sample_no"] for r in cur_rows})
+        if not (MIN_SELECTED <= len(selected) <= MAX_SELECTED):
+            flash(f"请圈选 {MIN_SELECTED}～{MAX_SELECTED} 个两版共有的样本号", "error")
+            return redirect(url_for("swap_check", ref=ref_version, cur=cur_version))
+        if any(s not in both for s in selected):
+            flash("只能圈选两版共有的样本号", "error")
+            return redirect(url_for("swap_check", ref=ref_version, cur=cur_version))
+
+        base_ctx = dict(
+            ref_version=ref_version,
+            cur_version=cur_version,
+            ref_batch=versions[ref_version]["batch_no"],
+            cur_batch=versions[cur_version]["batch_no"],
+            selected=selected,
+        )
+        common_items, per_sample = common_analytes(ref_rows, cur_rows, selected)
+        if len(common_items) < MIN_COMMON_ANALYTES:
+            storage.log(
+                "swap_check",
+                f"串号核查：参考 v{ref_version} × 当前 v{cur_version}，圈选 "
+                f"{len(selected)} 个样本，共有检测项目不足 {MIN_COMMON_ANALYTES} 个"
+                f"（{'、'.join(common_items) or '无'}），缺项，未给出更名建议",
+            )
+            return render_template(
+                "swap_result.html", outcome="missing",
+                common_items=common_items, per_sample=per_sample, **base_ctx,
+            )
+
+        costs = cost_matrix(ref_rows, cur_rows, selected, common_items)
+        best, optima = optimal_assignments(costs)
+        ident = identity_cost(costs)
+
+        if len(optima) > 1:
+            storage.log(
+                "swap_check",
+                f"串号核查：参考 v{ref_version} × 当前 v{cur_version}，存在 "
+                f"{len(optima)} 个并列最优方案（最低总代价 {best:.6g}），"
+                "不允许确认更名",
+            )
+            return render_template(
+                "swap_result.html", outcome="multiple",
+                common_items=common_items, best=best, optima_count=len(optima),
+                possibilities=possible_targets(selected, optima), **base_ctx,
+            )
+
+        if list(optima[0]) == list(range(len(selected))):
+            storage.log(
+                "swap_check",
+                f"串号核查：参考 v{ref_version} × 当前 v{cur_version}，"
+                f"同名配对即为最优（总代价 {ident:.6g}），未发现串号迹象",
+            )
+            return render_template(
+                "swap_result.html", outcome="no_swap",
+                common_items=common_items, ident=ident, **base_ctx,
+            )
+
+        # 唯一最优且不同于同名配对 ⇒ 必然严格优于同名配对，给出更名建议
+        mapping = mapping_from_assignment(selected, optima[0])
+        reg = storage.current_registry()
+        latest = reg["current_version"] if reg else 0
+        if cur_version != latest:
+            return render_template(
+                "swap_result.html", outcome="stale",
+                common_items=common_items,
+                stale_reason=(
+                    f"核查基于的当前版 v{cur_version} 已非最新登记版本 "
+                    f"v{latest}，更名建议不可确认"
+                ),
+                **base_ctx,
+            )
+
+        changed = changed_pairs(mapping)
+        token = storage.create_swap_session(
+            ref_version, cur_version, versions[cur_version]["batch_no"], mapping,
+        )
+        storage.log(
+            "swap_check",
+            f"串号核查：参考 v{ref_version} × 当前 v{cur_version}，唯一最优且优于"
+            f"同名配对（{best:.6g} < {ident:.6g}），给出更名建议 "
+            + "、".join(f"{k}→{v}" for k, v in sorted(changed.items())),
+        )
+        return render_template(
+            "swap_result.html", outcome="suggest",
+            common_items=common_items, best=best, ident=ident,
+            mapping=sorted(changed.items()),
+            kept=[s for s in selected if s not in changed],
+            evidence=evidence_rows(ref_rows, cur_rows, mapping, common_items),
+            token=token, **base_ctx,
+        )
+
+    @app.post("/swap-check/confirm/<token>")
+    def swap_confirm(token):
+        session = storage.get_swap_session(token)
+        if session is None:
+            flash("串号更名建议不存在或已过期，请重新核查", "error")
+            return redirect(url_for("swap_check"))
+
+        def stale_page(reason):
+            return render_template(
+                "swap_result.html", outcome="stale",
+                ref_version=session["ref_version"],
+                cur_version=session["cur_version"],
+                ref_batch="",
+                cur_batch=session["batch_no"],
+                selected=sorted(session["mapping"].keys()),
+                common_items=None,
+                stale_reason=reason,
+            ), 409
+
+        reg = storage.current_registry()
+        current_version = reg["current_version"] if reg else 0
+        if session["status"] != "pending" or session["cur_version"] != current_version:
+            # 确认前当前版已被他人发布的新版本替换：旧建议失效，原文件和登记不变
+            if session["status"] == "pending":
+                storage.mark_swap_obsolete(token, current_version)
+                reason = (
+                    f"建议已失效：核查基于当前版 v{session['cur_version']}，"
+                    f"但当前版本已变为 v{current_version}（他人已发布新版本）。"
+                    "原文件和登记未做任何更改，请重新核查。"
+                )
+            else:
+                reason = {
+                    "published": "该更名建议已经发布，不能重复确认",
+                    "obsolete": "该更名建议已被更新的发布超越而作废",
+                    "cancelled": "该更名建议已被放弃（取消）",
+                }.get(session["status"], "该更名建议已失效")
+            return stale_page(reason)
+
+        try:
+            new_version, row_count, changed = storage.publish_swap(token)
+        except PublishConflictError as exc:
+            # 预检后、事务前又被其他发布超越的极端竞态
+            return stale_page(str(exc))
+        except sqlite3.OperationalError as exc:  # 极端并发下写锁等待超时
+            app.logger.warning("swap publish lock contention: %s", exc)
+            flash("当前有其他发布正在写入，请稍后重试", "error")
+            return redirect(url_for("swap_check"))
+        pairs = "、".join(f"{k}→{v}" for k, v in sorted(changed.items()))
+        flash(
+            f"串号更名已发布：v{new_version}（依据参考 v{session['ref_version']} × "
+            f"当前 v{session['cur_version']} 的核查建议），置换样本号 {pairs}，"
+            f"浓度与其他行未变，共 {row_count} 行",
+            "success",
+        )
+        return redirect(url_for("index"))
+
+    @app.post("/swap-check/cancel/<token>")
+    def swap_cancel(token):
+        if storage.cancel_swap_session(token):
+            flash("已放弃本次串号更名建议，当前发布版本未受影响", "info")
+        return redirect(url_for("swap_check"))
 
     @app.get("/published.csv")
     def published_csv():

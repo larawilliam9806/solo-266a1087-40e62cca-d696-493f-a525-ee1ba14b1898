@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}串号核查结果 · 水质批次修订发布{% endblock %}
+{% block content %}
+
+<div class="card">
+  <h2>串号核查结果</h2>
+  <div class="meta">
+    <div><b>历史参考版本</b><span>v{{ ref_version }}{% if ref_batch %} · {{ ref_batch }}{% endif %}</span></div>
+    <div><b>当前版本</b><span>v{{ cur_version }}{% if cur_batch %} · {{ cur_batch }}{% endif %}</span></div>
+    <div><b>圈选样本</b><span>{{ selected|length }} 个</span></div>
+    {% if common_items %}
+    <div><b>共有检测项目（{{ common_items|length }} 项）</b>
+      <span style="font-size:14px">{{ common_items|join('、') }}</span></div>
+    {% endif %}
+  </div>
+  <p class="muted">圈选样本号：{{ selected|join('、') }}</p>
+
+  {% if outcome == 'missing' %}
+  <div class="banner">
+    <strong>缺项：无法给出更名建议。</strong>
+    所选样本在两版没有同一组至少两个检测项目（共有项目组：{{
+      common_items|join('、') if common_items else '无' }}），
+    无法计算配对代价，本次不给出更名建议。请核对下列各样本在两版的检测项目后重新圈选。
+  </div>
+  <table>
+    <thead><tr>
+      <th>样本号</th>
+      <th>v{{ ref_version }}（参考）检测项目</th>
+      <th>v{{ cur_version }}（当前）检测项目</th>
+      <th>当前版缺项</th>
+      <th>参考版缺项</th>
+    </tr></thead>
+    <tbody>
+    {% for s in per_sample %}
+      <tr>
+        <td>{{ s.sample_no }}</td>
+        <td>{{ s.ref_analytes|join('、') }}</td>
+        <td>{{ s.cur_analytes|join('、') }}</td>
+        <td>{% if s.missing_in_cur %}<span class="tag del">{{ s.missing_in_cur|join('、') }}</span>{% else %}—{% endif %}</td>
+        <td>{% if s.missing_in_ref %}<span class="tag del">{{ s.missing_in_ref|join('、') }}</span>{% else %}—{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  {% elif outcome == 'multiple' %}
+  <div class="banner warn">
+    <strong>存在 {{ optima_count }} 个并列总代价最优（{{ '%.6g'|format(best) }}）的配对方案，
+      无法唯一确定对应关系，不允许确认更名。</strong>
+    下表列出各样本在所有最优方案中可能对应的编号；请补充检测数据或调整圈选范围后重新核查。
+  </div>
+  <table>
+    <thead><tr>
+      <th>当前号（v{{ cur_version }}）</th>
+      <th>在所有最优方案中可能对应的参考号（v{{ ref_version }}）</th>
+    </tr></thead>
+    <tbody>
+    {% for p in possibilities %}
+      <tr>
+        <td>{{ p.cur_no }}</td>
+        <td>{{ p.candidates|join('、') }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  {% elif outcome == 'no_swap' %}
+  <div class="banner ok">
+    <strong>未发现串号迹象。</strong>
+    同名配对即为全局最优方案（总代价 {{ '%.6g'|format(ident) }}），
+    圈选样本的编号无需更名。
+  </div>
+
+  {% elif outcome == 'suggest' %}
+  <div class="banner ok">
+    <strong>发现疑似串号，建议更名。</strong>
+    唯一最优配对方案总代价 {{ '%.6g'|format(best) }}，优于同名配对总代价
+    {{ '%.6g'|format(ident) }}。
+  </div>
+  <table>
+    <thead><tr>
+      <th>当前号（v{{ cur_version }}）</th><th></th>
+      <th>应改为（依据 v{{ ref_version }} 参考号）</th>
+    </tr></thead>
+    <tbody>
+    {% for cur_no, ref_no in mapping %}
+      <tr><td>{{ cur_no }}</td><td class="arrow">→</td><td><strong>{{ ref_no }}</strong></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if kept %}
+  <p class="muted">其余圈选样本保持原名：{{ kept|join('、') }}</p>
+  {% endif %}
+
+  <details style="margin-top:10px">
+    <summary style="cursor:pointer;font-weight:600">逐项对照证据（{{ evidence|length }} 行：当前号浓度 vs 建议对应参考号浓度）</summary>
+    <div class="scroll" style="margin-top:10px"><table>
+      <thead><tr>
+        <th>当前号</th><th>对应参考号</th><th>检测项目</th>
+        <th>当前浓度 (mg/L)</th><th>参考浓度 (mg/L)</th><th>绝对差</th>
+      </tr></thead>
+      <tbody>
+      {% for e in evidence %}
+        <tr>
+          <td>{{ e.cur_no }}</td><td>{{ e.ref_no }}</td><td>{{ e.analyte }}</td>
+          <td>{{ e.cur_conc|conc }}</td><td>{{ e.ref_conc|conc }}</td>
+          <td>{{ e.diff|conc }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </details>
+
+  <p class="muted" style="margin-top:14px">
+    确认后<strong>仅置换以上圈选样本在当前批次（v{{ cur_version }}）的编号</strong>，
+    浓度与其他行保持原样，并以新版本发布；确认前若当前版已被他人发布的新版本替换，
+    本建议自动失效，原文件和登记不会改动。
+  </p>
+  <div class="actions">
+    <form method="post" action="{{ url_for('swap_confirm', token=token) }}">
+      <button type="submit">确认更名并发布新版本</button>
+    </form>
+    <form method="post" action="{{ url_for('swap_cancel', token=token) }}">
+      <button type="submit" class="ghost">放弃本次建议</button>
+    </form>
+  </div>
+
+  {% elif outcome == 'stale' %}
+  <div class="banner">
+    <strong>该更名建议已失效，未做任何更改。</strong>
+    {{ stale_reason }}。原文件和登记保持不变，请返回核查页重新选择版本核查。
+  </div>
+  {% endif %}
+
+  <div class="actions">
+    <a href="{{ url_for('swap_check', ref=ref_version, cur=cur_version) }}"><button type="button" class="ghost">返回核查页</button></a>
+    <a href="{{ url_for('index') }}"><button type="button" class="ghost">返回首页</button></a>
+  </div>
+</div>
+
+{% endblock %}

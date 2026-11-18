@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}串号核查 · 水质批次修订发布{% endblock %}
+{% block content %}
+
+<div class="card">
+  <h2>串号核查 · 第一步：选择对比版本</h2>
+  <p class="muted">
+    检测批次疑似贴错样本号时，选择一个可信的<strong>历史参考版本</strong>与
+    <strong>当前版本</strong>比对。随后圈选两版共有的样本号（{{ min_selected }}～{{
+    max_selected }} 个），系统按各检测项目「浓度绝对差之和」计算样本配对代价，
+    求全局一对一最小总代价方案：仅当方案唯一且优于同名配对时才给出更名建议；
+    存在多个并列最优时只列出各样本可能对应的编号，不允许确认更名。
+  </p>
+  {% if versions|length >= 2 %}
+  <form method="get" action="{{ url_for('swap_check') }}">
+    <label for="ref">历史参考版本</label>
+    <select id="ref" name="ref" required>
+      <option value="" disabled {% if ref_version is none %}selected{% endif %}>请选择</option>
+      {% for v in versions %}
+      <option value="{{ v.version }}" {% if ref_version == v.version %}selected{% endif %}>
+        v{{ v.version }} · 批次 {{ v.batch_no }} · {{ v.row_count }} 行
+      </option>
+      {% endfor %}
+    </select>
+    <label for="cur">当前版本（疑似贴错样本号的批次）</label>
+    <select id="cur" name="cur" required>
+      {% for v in versions %}
+      <option value="{{ v.version }}" {% if cur_version == v.version %}selected{% endif %}>
+        v{{ v.version }} · 批次 {{ v.batch_no }} · {{ v.row_count }} 行
+        {% if reg and v.version == reg.current_version %}（登记当前版）{% endif %}
+      </option>
+      {% endfor %}
+    </select>
+    <div class="actions">
+      <button type="submit">下一步：圈选样本号</button>
+      <a href="{{ url_for('index') }}"><button type="button" class="ghost">返回首页</button></a>
+    </div>
+  </form>
+  {% else %}
+  <p class="muted" style="margin-bottom:0">
+    至少需要两个已发布版本才能核查（当前已有 {{ versions|length }} 个）。
+    请先在<a href="{{ url_for('index') }}">首页</a>发布历史批次与当前批次。
+  </p>
+  {% endif %}
+</div>
+
+{% if common_samples is not none %}
+<div class="card">
+  <h2>第二步：圈选样本号（参考 v{{ ref_version }} × 当前 v{{ cur_version }}）</h2>
+  {% if common_samples|length >= min_selected %}
+  <p class="muted">
+    两版共有样本号 {{ common_samples|length }} 个，请勾选 {{ min_selected }}～{{
+    max_selected }} 个。所选样本在两版必须有同一组至少两个检测项目，
+    否则将提示缺项且不给出更名建议。
+  </p>
+  <form method="post" action="{{ url_for('swap_analyze') }}" id="pick-form">
+    <input type="hidden" name="ref" value="{{ ref_version }}">
+    <input type="hidden" name="cur" value="{{ cur_version }}">
+    <div class="check-list">
+      {% for s in common_samples %}
+      <label>
+        <input type="checkbox" name="sample" value="{{ s.sample_no }}">
+        <span>{{ s.sample_no }}<br>
+          <span class="muted">参考 {{ s.ref_count }} 项 / 当前 {{ s.cur_count }} 项</span>
+        </span>
+      </label>
+      {% endfor %}
+    </div>
+    <div class="actions" style="align-items:center">
+      <button type="submit" id="analyze-btn" disabled>开始核查</button>
+      <span class="muted">已选 <span id="pick-count">0</span> 个（需 {{ min_selected }}～{{ max_selected }} 个）</span>
+    </div>
+  </form>
+  <script>
+    (function () {
+      var MIN = {{ min_selected }}, MAX = {{ max_selected }};
+      var boxes = document.querySelectorAll('#pick-form input[name="sample"]');
+      var btn = document.getElementById('analyze-btn');
+      var counter = document.getElementById('pick-count');
+      function refresh() {
+        var n = document.querySelectorAll(
+          '#pick-form input[name="sample"]:checked').length;
+        counter.textContent = n;
+        btn.disabled = !(n >= MIN && n <= MAX);
+      }
+      boxes.forEach(function (b) { b.addEventListener('change', refresh); });
+      refresh();
+    })();
+  </script>
+  {% else %}
+  <p class="muted" style="margin-bottom:0">
+    两版共有样本号不足 {{ min_selected }} 个（当前 {{ common_samples|length }} 个），无法核查。
+  </p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}

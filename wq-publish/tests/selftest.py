@@ -6,10 +6,12 @@
 3. 并发：两个页面从同一版本发起，仅一个发布成功，另一个 409 须重新预览
 4. 崩溃恢复：文件缺失、文件被改坏、遗留临时文件、游离文件、改名后未提交
 5. 撤回语义：整批替换后旧行消失；会话取消/重复发布防护
+6. 串号核查：配对算法、缺项、多最优、唯一最优更名、确认前版本被替换则失效
 """
 import hashlib
 import io
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -18,6 +20,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wq_publish.app import create_app
 from wq_publish.storage import LIVE_FILENAME
+from wq_publish.swapcheck import (
+    apply_mapping,
+    common_analytes,
+    optimal_assignments,
+    possible_targets,
+)
 from wq_publish.validation import render_csv, validate_csv
 
 PASS, FAIL = 0, 0
@@ -87,7 +95,6 @@ print("== 2. 首次发布 v1 ==")
 resp = upload(client, "batch_v1.csv", "BATCH-001")
 check("预览页 200 且显示增删改", resp.status_code == 200
       and "新增".encode() in resp.data and "撤回".encode() in resp.data)
-import re
 m = re.search(rb'/publish/([0-9a-f]+)', resp.data)
 check("预览页含发布令牌", m is not None)
 token1 = m.group(1).decode()
@@ -208,6 +215,197 @@ check("取消后发布被拒绝（409 且会话 cancelled）",
 check("取消不影响当前版本",
       app.storage.current_registry()["current_version"] == v_before)
 
+# ---------------- 7. 串号核查 ----------------
+print("== 7. 串号核查 ==")
+
+# 7a 算法单元测试
+costs = [[1.0, 0.0], [0.0, 1.0]]
+best, optima = optimal_assignments(costs)
+check("唯一最优指派（交换）", best == 0.0 and optima == [(1, 0)],
+      f"best={best} optima={optima}")
+best, optima = optimal_assignments([[0.0, 0.0], [0.0, 0.0]])
+check("并列最优被全部列出", best == 0.0 and len(optima) == 2, f"optima={optima}")
+pts = possible_targets(["A", "B"], [(0, 1), (1, 0)])
+check("多最优时逐样本列出可能编号",
+      pts[0]["candidates"] == ["A", "B"] and pts[1]["candidates"] == ["A", "B"])
+common, per = common_analytes(
+    [{"sample_no": "S1", "analyte": "氨氮", "concentration": 1.0},
+     {"sample_no": "S1", "analyte": "总磷", "concentration": 0.1}],
+    [{"sample_no": "S1", "analyte": "氨氮", "concentration": 1.0}],
+    ["S1"])
+check("共有项目组与缺项对照", common == ["氨氮"] and per[0]["missing_in_cur"] == ["总磷"],
+      f"common={common} per={per}")
+remapped = apply_mapping(
+    [{"sample_no": "A", "analyte": "x", "concentration": 1.0},
+     {"sample_no": "B", "analyte": "x", "concentration": 2.0},
+     {"sample_no": "C", "analyte": "x", "concentration": 3.0}],
+    {"A": "B", "B": "A"})
+check("更名映射只置换编号、浓度与其他行不变",
+      remapped[0] == {"sample_no": "B", "analyte": "x", "concentration": 1.0}
+      and remapped[1] == {"sample_no": "A", "analyte": "x", "concentration": 2.0}
+      and remapped[2] == {"sample_no": "C", "analyte": "x", "concentration": 3.0})
+
+# 7b 端到端：独立环境，v1 为参考版，v2 把 S001/S002 贴反
+tmp2 = tempfile.mkdtemp(prefix="wq-selftest-swap-")
+data2 = os.path.join(tmp2, "data")
+down2 = os.path.join(tmp2, "downstream")
+app2 = create_app(data_dir=data2, downstream_dir=down2)
+client2 = app2.test_client()
+live2 = os.path.join(down2, LIVE_FILENAME)
+
+
+def csv_of(pairs):
+    lines = ["样本号,检测项目,浓度(mg/L)"]
+    lines += [f"{s},{a},{c}" for s, a, c in pairs]
+    return "\n".join(lines) + "\n"
+
+
+def publish_text(cli, text, batch_no):
+    resp = cli.post("/preview",
+                    data={"batch_no": batch_no,
+                          "csv_file": (io.BytesIO(text.encode("utf-8")), "b.csv")},
+                    content_type="multipart/form-data")
+    assert resp.status_code == 200, resp.data[:200]
+    token = re.search(rb'/publish/([0-9a-f]+)', resp.data).group(1).decode()
+    assert cli.post(f"/publish/{token}").status_code == 302
+    return app2.storage.current_registry()["current_version"]
+
+
+def analyze(cli, ref, cur, samples):
+    return cli.post("/swap-check/analyze",
+                    data={"ref": ref, "cur": cur, "sample": samples})
+
+
+V_REF = csv_of([("S001", "氨氮", 1.0), ("S001", "总磷", 0.10),
+                ("S002", "氨氮", 2.0), ("S002", "总磷", 0.20),
+                ("S003", "氨氮", 3.0), ("S003", "总磷", 0.30),
+                ("S004", "氨氮", 4.0), ("S004", "总磷", 0.40)])
+V_SWAP = csv_of([("S001", "氨氮", 2.0), ("S001", "总磷", 0.20),
+                 ("S002", "氨氮", 1.0), ("S002", "总磷", 0.10),
+                 ("S003", "氨氮", 3.0), ("S003", "总磷", 0.30),
+                 ("S004", "氨氮", 4.0), ("S004", "总磷", 0.40)])
+check("发布参考版 v1", publish_text(client2, V_REF, "REF-001") == 1)
+check("发布疑似贴错版 v2", publish_text(client2, V_SWAP, "CUR-002") == 2)
+
+resp = client2.get("/swap-check")
+check("核查页 200 且列出两版", resp.status_code == 200
+      and "v1".encode() in resp.data and "v2".encode() in resp.data)
+resp = client2.get("/swap-check?ref=1&cur=2")
+check("圈选页列出两版共有样本号", resp.status_code == 200
+      and all(f'value="S00{i}"'.encode() in resp.data for i in range(1, 5)))
+resp = client2.get("/swap-check?ref=2&cur=2")
+check("参考版与当前版相同被拒", "不能相同".encode() in resp.data)
+
+resp = analyze(client2, 1, 2, ["S001", "S002"])
+body = resp.data.decode()
+swap_token = re.search(r'/swap-check/confirm/([0-9a-f]+)', body)
+check("唯一最优且优于同名配对 → 给出更名建议",
+      resp.status_code == 200 and "建议更名" in body and swap_token, body[:200])
+check("建议页注明两版编号", "v1" in body and "v2" in body)
+check("建议映射为 S001→S002、S002→S001",
+      "S001" in body and "S002" in body and "确认更名并发布新版本" in body)
+swap_token = swap_token.group(1)
+
+resp = client2.post(f"/swap-check/confirm/{swap_token}")
+check("确认更名后 302 回首页", resp.status_code == 302)
+reg2 = app2.storage.current_registry()
+check("更名发布为 v3 且批次号沿用当前批", reg2["current_version"] == 3
+      and reg2["batch_no"] == "CUR-002", f"got {dict(reg2)}")
+rows2 = {(r["sample_no"], r["analyte"]): r["concentration"]
+         for r in app2.storage.current_rows()}
+check("更名后编号被置换且浓度不变",
+      rows2 == {("S001", "氨氮"): 1.0, ("S001", "总磷"): 0.10,
+                ("S002", "氨氮"): 2.0, ("S002", "总磷"): 0.20,
+                ("S003", "氨氮"): 3.0, ("S003", "总磷"): 0.30,
+                ("S004", "氨氮"): 4.0, ("S004", "总磷"): 0.40},
+      f"got {rows2}")
+check("更名后文件哈希与登记一致",
+      hashlib.sha256(open(live2, "rb").read()).hexdigest() == reg2["content_hash"])
+
+# 7c 同名配对已最优 → 无串号
+resp = analyze(client2, 1, 3, ["S003", "S004"])
+body = resp.data.decode()
+check("同名配对最优 → 未发现串号、无确认入口",
+      "未发现串号" in body and "/swap-check/confirm/" not in body, body[:200])
+
+# 7d 圈选数量校验
+check("只选 1 个样本被拒", analyze(client2, 1, 3, ["S001"]).status_code == 302)
+check("选 9 个样本被拒",
+      analyze(client2, 1, 3, [f"X{i}" for i in range(9)]).status_code == 302)
+check("非两版共有样本被拒",
+      analyze(client2, 1, 3, ["S001", "NOPE"]).status_code == 302)
+
+# 7e 缺项：v4 中 S003 只剩氨氮一个项目
+V_MISSING = csv_of([("S001", "氨氮", 1.0), ("S001", "总磷", 0.10),
+                    ("S002", "氨氮", 2.0), ("S002", "总磷", 0.20),
+                    ("S003", "氨氮", 3.0),
+                    ("S004", "氨氮", 4.0), ("S004", "总磷", 0.40)])
+check("发布缺项版 v4", publish_text(client2, V_MISSING, "CUR-004") == 4)
+resp = analyze(client2, 3, 4, ["S003", "S004"])
+body = resp.data.decode()
+check("共有项目不足两个 → 提示缺项且不给建议",
+      "缺项" in body and "/swap-check/confirm/" not in body, body[:200])
+check("缺项页注明两版编号", "v3" in body and "v4" in body)
+
+# 7f 多最优：v5/v6 中 S003 与 S004 浓度完全相同
+V_TWIN = csv_of([("S001", "氨氮", 1.0), ("S001", "总磷", 0.10),
+                 ("S002", "氨氮", 2.0), ("S002", "总磷", 0.20),
+                 ("S003", "氨氮", 3.0), ("S003", "总磷", 0.30),
+                 ("S004", "氨氮", 3.0), ("S004", "总磷", 0.30)])
+check("发布孪生版 v5", publish_text(client2, V_TWIN, "CUR-005") == 5)
+check("发布孪生版 v6", publish_text(client2, V_TWIN, "CUR-006") == 6)
+resp = analyze(client2, 5, 6, ["S003", "S004"])
+body = resp.data.decode()
+check("并列最优 → 列出可能编号且不允许确认更名",
+      "并列" in body and "不允许确认更名" in body
+      and "/swap-check/confirm/" not in body, body[:200])
+check("多最优页列出 S003/S004 互为其候选", "S003、S004" in body)
+
+# 7g 确认前当前版被他人替换 → 旧建议失效，原文件和登记不变
+V_SWAP2 = csv_of([("S001", "氨氮", 2.0), ("S001", "总磷", 0.20),
+                  ("S002", "氨氮", 1.0), ("S002", "总磷", 0.10),
+                  ("S003", "氨氮", 3.0), ("S003", "总磷", 0.30),
+                  ("S004", "氨氮", 3.0), ("S004", "总磷", 0.30)])
+check("发布再次贴错版 v7", publish_text(client2, V_SWAP2, "CUR-007") == 7)
+resp = analyze(client2, 6, 7, ["S001", "S002"])
+stale_token = re.search(r'/swap-check/confirm/([0-9a-f]+)',
+                        resp.data.decode()).group(1)
+V_OTHER = csv_of([("S001", "氨氮", 2.0), ("S001", "总磷", 0.20),
+                  ("S002", "氨氮", 1.0), ("S002", "总磷", 0.10),
+                  ("S003", "氨氮", 3.0), ("S003", "总磷", 0.30),
+                  ("S004", "氨氮", 3.5), ("S004", "总磷", 0.35)])
+check("他人抢先发布 v8", publish_text(client2, V_OTHER, "OTHER-008") == 8)
+hash_v8 = hashlib.sha256(open(live2, "rb").read()).hexdigest()
+resp = client2.post(f"/swap-check/confirm/{stale_token}")
+body = resp.data.decode()
+check("确认时版本已被替换 → 409 且提示建议失效",
+      resp.status_code == 409 and "已失效" in body and "原文件和登记" in body,
+      f"{resp.status_code} {body[:200]}")
+reg2 = app2.storage.current_registry()
+check("失效后登记仍为 v8 且文件未变",
+      reg2["current_version"] == 8
+      and hashlib.sha256(open(live2, "rb").read()).hexdigest() == hash_v8)
+check("失效建议会话被标记 obsolete",
+      app2.storage.get_swap_session(stale_token)["status"] == "obsolete")
+
+# 7h 更名建议可放弃；放弃后确认被拒
+V_SWAP3 = csv_of([("S001", "氨氮", 1.0), ("S001", "总磷", 0.10),
+                  ("S002", "氨氮", 2.0), ("S002", "总磷", 0.20),
+                  ("S003", "氨氮", 3.0), ("S003", "总磷", 0.30),
+                  ("S004", "氨氮", 3.5), ("S004", "总磷", 0.35)])
+check("发布再次贴错版 v9", publish_text(client2, V_SWAP3, "CUR-009") == 9)
+resp = analyze(client2, 8, 9, ["S001", "S002"])
+cancel_token = re.search(r'/swap-check/confirm/([0-9a-f]+)',
+                         resp.data.decode()).group(1)
+client2.post(f"/swap-check/cancel/{cancel_token}")
+resp = client2.post(f"/swap-check/confirm/{cancel_token}")
+check("放弃后确认被拒（409 且会话 cancelled）",
+      resp.status_code == 409
+      and app2.storage.get_swap_session(cancel_token)["status"] == "cancelled")
+check("放弃不影响当前版本",
+      app2.storage.current_registry()["current_version"] == 9)
+
 shutil.rmtree(tmp, ignore_errors=True)
+shutil.rmtree(tmp2, ignore_errors=True)
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)

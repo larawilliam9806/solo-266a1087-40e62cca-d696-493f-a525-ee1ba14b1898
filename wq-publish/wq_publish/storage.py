@@ -18,6 +18,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from .swapcheck import apply_mapping
 from .validation import format_concentration, render_csv
 
 LIVE_FILENAME = "published_results.csv"
@@ -81,6 +82,15 @@ class Storage:
                     batch_no TEXT NOT NULL,
                     base_version INTEGER NOT NULL,
                     payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending','published','obsolete','cancelled'))
+                );
+                CREATE TABLE IF NOT EXISTS swap_sessions (
+                    token TEXT PRIMARY KEY,
+                    ref_version INTEGER NOT NULL,
+                    cur_version INTEGER NOT NULL,
+                    batch_no TEXT NOT NULL,
+                    mapping TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('pending','published','obsolete','cancelled'))
                 );
@@ -165,24 +175,28 @@ class Storage:
                     actions.append(msg)
                     self._log(conn, "recover", msg)
 
-            # 5) 超过 24 小时仍未确认的预览会话作废，避免无限期堆积
+            # 5) 超过 24 小时仍未确认的会话（批次修订 / 串号更名）作废，避免无限期堆积
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(
                 timespec="seconds"
             )
-            stale = conn.execute(
-                "SELECT token FROM revision_sessions "
-                "WHERE status='pending' AND created_at < ?",
-                (cutoff,),
-            ).fetchall()
-            for s in stale:
-                conn.execute(
-                    "UPDATE revision_sessions SET status='obsolete' WHERE token=?",
-                    (s["token"],),
-                )
-                self._log(
-                    conn, "recover",
-                    f"预览会话 {s['token'][:8]} 超过 24 小时未确认，已作废",
-                )
+            for table, label in (
+                ("revision_sessions", "预览会话"),
+                ("swap_sessions", "串号更名建议"),
+            ):
+                stale = conn.execute(
+                    f"SELECT token FROM {table} "
+                    "WHERE status='pending' AND created_at < ?",
+                    (cutoff,),
+                ).fetchall()
+                for s in stale:
+                    conn.execute(
+                        f"UPDATE {table} SET status='obsolete' WHERE token=?",
+                        (s["token"],),
+                    )
+                    self._log(
+                        conn, "recover",
+                        f"{label} {s['token'][:8]} 超过 24 小时未确认，已作废",
+                    )
         return actions
 
     def _quarantine(self, name: str) -> str:
@@ -305,6 +319,174 @@ class Storage:
                 self._log(conn, "cancel", f"放弃修订会话 {token[:8]}")
                 return cur.rowcount > 0
         return False
+
+    # ---------- 串号核查 ----------
+    def list_versions(self) -> list[dict]:
+        """全部已发布版本（新→旧），供核查页选择参考版本与当前版本。"""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT version, batch_no, COUNT(*) AS row_count FROM results "
+                "GROUP BY version ORDER BY version DESC"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def version_rows(self, version: int) -> list[dict]:
+        """指定版本的全部结果行（不存在时为空列表）。"""
+        with self._connect() as conn:
+            return self._version_rows(conn, version)
+
+    def version_samples(self, version: int) -> list[dict]:
+        """指定版本的样本号及其检测项目数（按样本号排序）。"""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT sample_no, COUNT(*) AS analyte_count FROM results "
+                "WHERE version = ? GROUP BY sample_no ORDER BY sample_no",
+                (version,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def create_swap_session(self, ref_version: int, cur_version: int,
+                            batch_no: str, mapping: dict) -> str:
+        """登记一条待确认的串号更名建议（当前号→参考号的全量映射）。"""
+        token = uuid.uuid4().hex
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO swap_sessions(token, ref_version, cur_version,"
+                " batch_no, mapping, created_at, status)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    token,
+                    ref_version,
+                    cur_version,
+                    batch_no,
+                    json.dumps(mapping, ensure_ascii=False),
+                    _now(),
+                    "pending",
+                ),
+            )
+        return token
+
+    def get_swap_session(self, token: str):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM swap_sessions WHERE token = ?", (token,)
+            ).fetchone()
+            if row is None:
+                return None
+            data = dict(row)
+            data["mapping"] = json.loads(data["mapping"])
+            return data
+
+    def cancel_swap_session(self, token: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE swap_sessions SET status='cancelled' "
+                "WHERE token=? AND status='pending'",
+                (token,),
+            )
+            if cur.rowcount:
+                self._log(conn, "cancel", f"放弃串号更名建议 {token[:8]}")
+                return True
+        return False
+
+    def mark_swap_obsolete(self, token: str, current_version: int) -> None:
+        """更名建议在确认前已被其他发布超越：作废该建议，强制重新核查。"""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE swap_sessions SET status='obsolete' "
+                "WHERE token=? AND status='pending'",
+                (token,),
+            )
+            if cur.rowcount:
+                self._log(
+                    conn, "conflict",
+                    f"串号更名建议 {token[:8]} 已失效（登记当前版 "
+                    f"v{current_version}），原文件和登记未变，需重新核查",
+                )
+
+    def publish_swap(self, token: str) -> tuple[int, int, dict]:
+        """确认串号更名：只置换圈选样本在当前批次的编号，浓度与其他行不变。
+
+        返回 (新版本号, 行数, 实际更名映射)。并发控制与 publish() 相同：
+        BEGIN IMMEDIATE 事务内核对登记当前版本仍等于建议所基于的 cur_version，
+        若期间已被他人发布的新版本替换，建议失效（会话作废），抛出
+        PublishConflictError，原文件和登记不做任何更改。
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            session = conn.execute(
+                "SELECT * FROM swap_sessions WHERE token=?", (token,)
+            ).fetchone()
+            if session is None:
+                raise PublishConflictError("串号更名建议不存在或已失效，请重新核查")
+            if session["status"] != "pending":
+                label = {"published": "已发布", "obsolete": "已失效",
+                         "cancelled": "已取消"}.get(
+                    session["status"], session["status"])
+                raise PublishConflictError(f"该串号更名建议{label}，请重新核查")
+
+            reg = conn.execute("SELECT * FROM registry WHERE id=1").fetchone()
+            current_version = reg["current_version"] if reg else 0
+            if session["cur_version"] != current_version:
+                conn.execute(
+                    "UPDATE swap_sessions SET status='obsolete' WHERE token=?",
+                    (token,),
+                )
+                self._log(
+                    conn, "conflict",
+                    f"串号更名建议 {token[:8]} 失效：基于当前版 "
+                    f"v{session['cur_version']}，但登记当前版已变为 "
+                    f"v{current_version}（他人已发布新版本），原文件和登记未变",
+                )
+                raise PublishConflictError(
+                    f"建议已失效：核查基于当前版 v{session['cur_version']}，"
+                    f"但当前版本已变为 v{current_version}（他人已发布新版本）。"
+                    "原文件和登记未做任何更改，请重新核查。"
+                )
+
+            mapping = json.loads(session["mapping"])
+            rows = self._version_rows(conn, current_version)
+            new_rows = apply_mapping(rows, mapping)
+            new_version = current_version + 1
+            csv_text = render_csv(new_rows)
+            content_hash = hashlib.sha256(csv_text.encode("utf-8")).hexdigest()
+
+            # 先原子替换文件，再落库登记（与整批发布同一崩溃恢复语义）
+            self._atomic_write(csv_text)
+
+            conn.executemany(
+                "INSERT INTO results(version, batch_no, sample_no, analyte,"
+                " concentration) VALUES (?,?,?,?,?)",
+                [
+                    (new_version, session["batch_no"], r["sample_no"],
+                     r["analyte"], r["concentration"])
+                    for r in new_rows
+                ],
+            )
+            conn.execute(
+                "INSERT INTO registry(id, current_version, batch_no, row_count,"
+                " published_at, content_hash) VALUES (1,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET current_version=excluded.current_version,"
+                " batch_no=excluded.batch_no, row_count=excluded.row_count,"
+                " published_at=excluded.published_at,"
+                " content_hash=excluded.content_hash",
+                (new_version, session["batch_no"], len(new_rows), _now(),
+                 content_hash),
+            )
+            conn.execute(
+                "UPDATE swap_sessions SET status='published' WHERE token=?",
+                (token,),
+            )
+            changed = {k: v for k, v in mapping.items() if k != v}
+            pairs = "、".join(f"{k}→{v}" for k, v in sorted(changed.items()))
+            self._log(
+                conn, "publish",
+                f"串号更名发布 v{new_version}：依据参考 v{session['ref_version']} × "
+                f"当前 v{session['cur_version']} 的核查建议，置换样本号 {pairs}，"
+                f"浓度与其他行不变，共 {len(new_rows)} 行，"
+                f"sha256={content_hash[:12]}…",
+            )
+            return new_version, len(new_rows), changed
 
     # ---------- 预览差异 ----------
     def preview_diff(self, new_rows: list[dict]) -> dict:

@@ -36,6 +36,15 @@
   </form>
 </div>
 
+<div class="card">
+  <h2>串号核查</h2>
+  <p class="muted" style="margin-bottom:12px">
+    怀疑当前批次样本号贴错？选择历史参考版本与当前版本比对，圈选 2～8 个两版共有的
+    样本号，系统按浓度绝对差之和求全局最优一对一配对，给出更名建议供确认。
+  </p>
+  <a href="{{ url_for('swap_check') }}"><button type="button" class="ghost">前往串号核查页</button></a>
+</div>
+
 {% if reg %}
 <div class="card">
   <h2>当前已发布数据（v{{ reg.current_version }}，共 {{ rows|length }} 行）</h2>
